@@ -3,13 +3,22 @@ import os
 import json
 import getpass
 import sys
+import hashlib
+import hmac
 
-from argon2 import PasswordHasher, exceptions
 import pyotp
 import qrcode
 
 CONFIG_PATH = os.path.expanduser("~/.myvault_config.json")
 VAULT_PATH  = os.path.expanduser("~/.myvault.txt")
+PBKDF2_ITER = 100_000
+KEY_LEN     = 32  # bytes
+
+def derive_key(password: bytes, salt: bytes) -> bytes:
+    """
+    Derive a key from password+salt using PBKDF2-HMAC-SHA256.
+    """
+    return hashlib.pbkdf2_hmac("sha256", password, salt, PBKDF2_ITER, dklen=KEY_LEN)
 
 def setup():
     if os.path.exists(CONFIG_PATH):
@@ -17,13 +26,15 @@ def setup():
         return
 
     # 1) Master password
-    ph = PasswordHasher()
-    pw  = getpass.getpass("Set master password: ")
-    pw2 = getpass.getpass("Confirm password: ")
+    pw  = getpass.getpass("Set master password: ").encode()
+    pw2 = getpass.getpass("Confirm password: ").encode()
     if pw != pw2:
         print("✗ Passwords did not match.")
         sys.exit(1)
-    pw_hash = ph.hash(pw)
+
+    # Derive and store salt+key
+    salt = os.urandom(16)
+    key  = derive_key(pw, salt)
 
     # 2) TOTP secret
     secret = pyotp.random_base32()
@@ -34,9 +45,14 @@ def setup():
     qrcode.print_ascii(uri)
     print(f"\n—or manually enter secret: {secret}\n")
 
-    # Save config
+    # Save config: base64-encode binary data for JSON safety
+    cfg = {
+        "salt": salt.hex(),
+        "key":  key.hex(),
+        "totp_secret": secret
+    }
     with open(CONFIG_PATH, "w") as f:
-        json.dump({"pw_hash": pw_hash, "totp_secret": secret}, f)
+        json.dump(cfg, f)
     print("✓ Vault setup complete. Store your notes in:", VAULT_PATH)
 
 def access():
@@ -45,19 +61,20 @@ def access():
         sys.exit(1)
 
     cfg = json.load(open(CONFIG_PATH))
-    ph = PasswordHasher()
+    salt = bytes.fromhex(cfg["salt"])
+    stored_key = bytes.fromhex(cfg["key"])
+    secret = cfg["totp_secret"]
 
     # 1) Verify password
-    pw = getpass.getpass("Master password: ")
-    try:
-        ph.verify(cfg["pw_hash"], pw)
-    except exceptions.VerifyMismatchError:
+    pw = getpass.getpass("Master password: ").encode()
+    key = derive_key(pw, salt)
+    if not hmac.compare_digest(key, stored_key):
         print("✗ Incorrect password.")
         sys.exit(1)
 
     # 2) Verify TOTP
     code = input("TOTP code: ").strip()
-    totp = pyotp.TOTP(cfg["totp_secret"])
+    totp = pyotp.TOTP(secret)
     if not totp.verify(code):
         print("✗ Invalid or expired code.")
         sys.exit(1)
